@@ -1,53 +1,159 @@
 # 🧬 Aero-Sanitize AI
 
-**An Industrial-Grade, Failsafe UV-C Sterilization Controller using Sensor Fusion.**
-*Built for the APC Project Competition.*
+**A failsafe, sensor-fusion UV-C sterilization controller for resource-limited clinics.**
+Built on the ESP32-S3 · No internet required · Nurse-facing web dashboard over SoftAP
+
+![Platform](https://img.shields.io/badge/platform-ESP32--S3-blue)
+![Status](https://img.shields.io/badge/status-prototype-yellow)
+![License](https://img.shields.io/badge/license-MIT-green)
+
+<!-- docs/images/dashboard-hero.png -->
+![Dashboard preview](docs/images/dashboard-hero.png)
 
 ---
 
 ## ⚠️ The Problem
-Standard UV-C sterilization systems in hospitals use basic passive infrared (PIR) motion sensors. These sensors frequently fail to detect anesthetized or motionless patients, leading to severe radiation burns. 
 
-## 💡 The Innovation: Sensor Fusion
-Aero-Sanitize AI eliminates false negatives by requiring **dual-confirmation** before activating the 220V UV-C relay. We combine:
-1. **Micro-Vibration Tracking (CDM324 Doppler Radar):** Detects breathing and heartbeats through surgical blankets.
-2. **Thermal Blob Analysis (AMG8833 Thermal Camera):** Scans an 8x8 matrix for human body heat signatures.
-3. **Environmental Checks:** LDR (Light Sensor) and MC-38 (Magnetic Door Switches) ensure the room is unlit and physically sealed.
+Standard UV-C sterilization systems rely on a single passive-infrared (PIR) motion sensor to confirm a room is empty. PIR sensors frequently miss **anesthetized, sedated, or motionless patients**, which can lead to severe UV-C radiation burns if the lamp fires with someone still inside.
 
-*The UV-C lamp activates ONLY when all four systems return a 100% CLEAR confidence score.*
+## 💡 The Approach: Sensor Fusion
 
----
+Aero-Sanitize AI requires **simultaneous agreement from independent sensors** before the 220V UV-C relay is allowed to close. The firmware treats "room is safe" as a hard AND of every input — one bad reading is enough to block or abort a cycle:
 
-## 🛠️ Hardware Architecture
-This system is powered by an **ESP32-S3** microcontroller and features a custom analog signal processing chain.
+| Signal | Sensor | What it catches |
+|---|---|---|
+| Micro-motion | CDM324 Doppler radar | Any movement, including subtle motion a PIR sensor would miss |
+| Body heat | AMG8833 8×8 thermal camera | A human heat signature even when a person is still |
+| Physical access | MC-38 magnetic reed switch | Whether the door is actually shut |
 
-| Component | Function | Operating Voltage |    
-| :--- | :--- | :--- |
-| **ESP32-S3 WROOM** | Core processing & SoftAP Dashboard | 3.3V |
-| **CDM324 5.8GHz** | Doppler Radar (IF out) | 5V |
-| **LM358 (x2)** | 2-Stage Signal Amplification & Comparator | 5V |
-| **AMG8833** | I2C Thermal Camera | 3.3V |
-| **MC-38** | Magnetic Door Reed Switches | 3.3V |
-| **5V Relay (10A)** | 220V Mains Control (Fake-out LED for demo) | 5V |
+Only when radar is clear, the hottest thermal pixel is below the body-heat threshold, **and** the door is confirmed closed does the system arm. It then runs a 10-second pre-ignition scan to confirm the room *stays* clear before the lamp ignites — and if any sensor trips mid-cycle, the lamp is cut within one control-loop tick.
 
-> **Safety Note:** The 5V analog signal from the LM358 chain is stepped down via a resistor voltage divider to protect the 3.3V ESP32 ADC pins.
+> **Design note:** the BOM includes an LDR light sensor, an RTC module, and a DHT22 as supporting/logging hardware. Only the DHT22 (ambient temp/humidity, informational only) is currently read by the firmware. The LDR and RTC are **not yet wired into `isRoomSafe()`** — see [Roadmap](#-roadmap) below. Keep this in mind when describing the safety guarantees to reviewers.
 
 ---
 
-## 💻 Software Architecture
-* **State Machine:** Non-blocking C++ architecture utilizing `millis()` instead of `delay()` to ensure the safety loop never freezes.
-* **SoftAP Dashboard:** The ESP32 hosts its own localized WiFi network (192.168.4.1), allowing medical staff to monitor the room safely from their phones without requiring hospital internet infrastructure.
-* **Digital Twin:** Validated in **Webots R2023b** via Python controller simulation prior to physical hardware deployment.
+## 🧠 State Machine
+
+```
+STANDBY → (room safe for 10s) → SCANNING → (10s clear) → UVC_ACTIVE → (60s) → STANDBY
+   ↑                                  |                        |
+   └──────────── UNSAFE ←─────────────┴────────────────────────┘
+                  (any sensor trips → lamp killed instantly)
+```
+
+- **STANDBY** – lamp off, watching sensors, auto-starts after 10s of a continuously clear room (or a nurse can trigger it manually from the dashboard).
+- **SCANNING** – a 10-second "are you sure" window before ignition.
+- **UVC_ACTIVE** – lamp on, 60-second sterilization cycle, aborts instantly on any sensor violation.
+- **UNSAFE** – lamp forced off; auto-recovers to STANDBY once the room is clear again.
+
+The whole loop is non-blocking (`millis()`-based, no `delay()`), so the safety check can never be frozen out by a slow network request.
 
 ---
 
-## 🚀 How to Run the Code
-1. Clone this repository.
-2. Open `AeroSanitize_Main.ino` in Arduino IDE 2.x.
-3. Ensure the **ESP32S3 Dev Module** board is selected.
-4. Install required libraries: `Adafruit_AMG88xx`, `DHT sensor library`, `RTClib`.
-5. Compile and upload. 
-6. Open Serial Monitor at `115200` baud rate to view the real-time sensor fusion confidence matrix.
+## 🛠️ Hardware
+
+| Component | Reference | Voltage |
+|---|---|---|
+| Microcontroller | ESP32-S3 WROOM N16R8, 44-pin | 3.3V |
+| Thermal camera | AMG8833 (8×8 pixel array) | 3.3V |
+| Doppler radar | CDM324 5.8GHz | 5V |
+| Signal amplification | 2× LM358 op-amp | 5V |
+| Light sensor *(planned)* | LDR photoresistor module | 3.3V |
+| Door sensors | 2× MC-38 magnetic reed switch | 3.3V |
+| Relay | 5V, 1-channel, 10A/250VAC | 5V |
+| Ambient sensor | DHT22 (temp/humidity, logging only) | 3.3V |
+| RTC *(planned)* | DS3231 + AT24C32 I2C, battery-free | 3.3V |
+| Battery | LIR2032 | 3V |
+| Lamp | Standard 220V blue LED (demo stand-in for UV-C) | 220V |
+
+Full BOM with part counts and connectors: [`docs/BOM.md`](docs/BOM.md).
+
+> The 5V analog output of the LM358 amplifier chain is stepped down through a resistor voltage divider before reaching the ESP32's 3.3V-tolerant ADC pins.
 
 ---
-*Created by **IES PES ENET'Com SBJC** for the APC Project Competition.*
+
+## 💻 Software
+
+- **C++ / Arduino framework** on ESP32-S3, non-blocking state machine.
+- **SoftAP dashboard** – the ESP32 hosts its own Wi-Fi network (`AeroSanitize-AI`) and serves a mobile-friendly live dashboard at `http://192.168.4.1`, so a nurse can watch cycle status from a phone with zero hospital IT dependency.
+- **Live polling** – the dashboard polls `/data` once per second (JSON), with connection-loss detection and an "OFFLINE" state if the controller stops responding.
+- **Manual override** – `/start` and `/stop` endpoints let staff manually trigger a cycle or hit Emergency Stop.
+- **Digital twin** – behavior validated in Webots R2023b via a Python controller before flashing physical hardware.
+
+### API
+
+| Route | Method | Purpose |
+|---|---|---|
+| `/` | GET | Serves the dashboard (cached 10 min, static) |
+| `/data` | GET | Live JSON sensor/state snapshot, no-cache |
+| `/start` | POST | Manually begin the pre-ignition scan (rejected unless STANDBY + safe) |
+| `/stop` | POST | Emergency stop — force lamp off, return to STANDBY |
+
+---
+
+## 🚀 Getting Started
+
+1. Clone this repo.
+2. Open `firmware/AeroSanitize_Main/AeroSanitize_Main.ino` in Arduino IDE 2.x.
+3. Board: **ESP32S3 Dev Module**.
+4. Install libraries: `Adafruit_AMG88xx`, `DHT sensor library`.
+5. Wire hardware per [`docs/wiring-diagram.png`](docs/wiring-diagram.png).
+6. Compile and upload.
+7. Connect your phone to the `AeroSanitize-AI` Wi-Fi network, then open `http://192.168.4.1` in a browser.
+8. Optional: open Serial Monitor at `115200` baud for real-time state-machine logs.
+
+---
+
+## 📁 Repo Structure
+
+```
+Aero-Sanitize-AI/
+├── README.md
+├── LICENSE
+├── firmware/
+│   └── AeroSanitize_Main/
+│       └── AeroSanitize_Main.ino
+├── simulation/                 # Webots digital-twin controller (if applicable)
+│   └── webots_controller.py
+├── docs/
+│   ├── BOM.md                  # Full bill of materials (from your table)
+│   ├── wiring-diagram.png       # Fritzing/schematic export
+│   ├── system-architecture.png  # Block diagram: sensors → MCU → relay → dashboard
+│   └── images/
+│       ├── logo.png
+│       ├── dashboard-hero.png   # Screenshot of the live dashboard
+│       └── prototype-photo.jpg  # Photo of the built breadboard/enclosure
+└── .gitignore
+```
+
+**On your specific question — yes, put the logo and dashboard screenshot in the repo**, just not loose in the root. A clean pattern:
+
+- **Logo** → `docs/images/logo.png`, referenced once near the top of the README (as done above). Keep it small (≤200px wide) so it doesn't dominate the page.
+- **Dashboard screenshot(s)** → `docs/images/dashboard-hero.png` (or a short GIF, `dashboard-demo.gif`, showing a full STANDBY → SCANNING → ACTIVE cycle). This does more for a judge/reviewer than any paragraph of text — embed it right under the title, like the placeholder above.
+- **Wiring diagram / schematic** → also under `docs/`, referenced from the Hardware section, not inlined at full size in the README body (keeps the page scannable).
+- Avoid committing large raw video files to the repo itself — link to a hosted demo video (YouTube/Drive) instead if you have one; GitHub repos get unwieldy fast with video assets.
+
+To embed an image in markdown once it's in `docs/images/`:
+```markdown
+![Dashboard preview](docs/images/dashboard-hero.png)
+```
+Relative paths like this render correctly on GitHub without any extra configuration.
+
+---
+
+## 🗺️ Roadmap
+
+- [ ] Wire the LDR into `isRoomSafe()` as a fourth confirmation signal (room must also be unlit)
+- [ ] Integrate DS3231 RTC for timestamped cycle logging (currently no persistent log)
+- [ ] Move UV-C dose tracking (cumulative lamp-on time) into persistent storage
+- [ ] Physical enclosure + IP-rated sensor housing for clinical deployment
+
+---
+
+## 📜 License
+
+MIT — see [`LICENSE`](LICENSE).
+
+---
+
+*Built by **IES PES ENET'Com SBJC** for the APC Project Competition.*
