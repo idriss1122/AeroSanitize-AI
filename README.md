@@ -126,20 +126,6 @@ Aero-Sanitize-AI/
 └── .gitignore
 ```
 
-**On your specific question — yes, put the logo and dashboard screenshot in the repo**, just not loose in the root. A clean pattern:
-
-- **Logo** → `docs/images/logo.png`, referenced once near the top of the README (as done above). Keep it small (≤200px wide) so it doesn't dominate the page.
-- **Dashboard screenshot(s)** → `docs/images/dashboard-hero.png` (or a short GIF, `dashboard-demo.gif`, showing a full STANDBY → SCANNING → ACTIVE cycle). This does more for a judge/reviewer than any paragraph of text — embed it right under the title, like the placeholder above.
-- **Wiring diagram / schematic** → also under `docs/`, referenced from the Hardware section, not inlined at full size in the README body (keeps the page scannable).
-- Avoid committing large raw video files to the repo itself — link to a hosted demo video (YouTube/Drive) instead if you have one; GitHub repos get unwieldy fast with video assets.
-
-To embed an image in markdown once it's in `docs/images/`:
-```markdown
-![Dashboard preview](docs/images/dashboard-hero.png)
-```
-Relative paths like this render correctly on GitHub without any extra configuration.
-
----
 
 ## 🗺️ Roadmap
 
