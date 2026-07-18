@@ -10,8 +10,14 @@
 #define RELAY_PIN   14   // UV-C lamp relay
 #define RADAR_PIN    5   // Radar OUT              HIGH = motion
 #define DOOR_PIN    12   // Reed switch            INPUT_PULLUP, LOW = closed
-#define DHT_PIN     15   // DHT22 humidity         fed to the AI dose model
-#define LDR_PIN     34   // LDR                    fed to the AI dose model + bulb-health check
+#define DHT_PIN     15   // DHT22 humidity+temp    fed to the AI dose model + thermal baseline
+#define LDR_PIN      4   // LDR (ADC1_CH3)         fed to the AI dose model + bulb-health check
+// NOTE: this MUST be an ADC1-capable pin (GPIO1–10 on the ESP32-S3). GPIO34
+// is a valid ADC1 pin on the *original* ESP32 but has no ADC hardware behind
+// it at all on the S3 — analogRead() on a non-ADC pin silently returns 0,
+// which is exactly the "always reads 0" symptom. GPIO4 is free here (I2C
+// has 8/9, radar has 5), but rewire the physical LDR divider to match
+// whatever pin you actually pick.
 #define DHTTYPE     DHT22
 
 // SDA = GPIO 8, SCL = GPIO 9 on ESP32-S3 — shared by the AMG8833 AND the RTC.
@@ -35,12 +41,58 @@ const unsigned long AI_TRIGGER_DELAY_MS =  4000UL; // Lamp warm-up before the LD
 // ── SAFETY / AI THRESHOLDS ───────────────────────────────────────────────────
 const int   LDR_FAULT_THRESHOLD    = 550;   // below this, the bulb is considered dead/degraded
 const float MAX_PREDICTED_MINUTES  = 60.0;  // sanity cap on the AI-predicted dose
+const int   LDR_ADC_MAX            = 4095;  // 12-bit ADC full-scale, used to invert the raw LDR reading
+
+// ── THERMAL OCCUPANCY DETECTION (ambient-relative, not absolute) ─────────────
+// A fixed "> 34.0C" cutoff false-triggers in a room that's simply hot. Instead,
+// occupancy is judged by how far the AMG8833's hottest pixel rises ABOVE the
+// DHT22's live ambient air reading. A person's skin-surface reading normally
+// sits several degrees above whatever the room air currently is, even when
+// the room itself is warm — so the delta stays a meaningful signal even on
+// a hot day, whereas the absolute pixel value does not.
+const float THERMAL_DELTA_THRESHOLD = 3.5f;  // 🔶 TUNE THIS: degrees above ambient that counts as "human present"
+const float THERMAL_ABS_CEILING     = 42.0f; // hard safety cap regardless of ambient (e.g. overheat/fire), independent of occupancy logic
+
+// ── DHT22 RELIABILITY TRACKING ────────────────────────────────────────────────
+// The DHT22 datasheet requires >=2s between reads; the old code re-read it
+// every 300ms on the same cadence as the other sensors. That either returns a
+// cached/stale value or NaN depending on the library, and gets worse once the
+// relay/UV-C ballast starts switching and injects noise onto the single-wire
+// line. The old "if NaN, keep last good value" logic then silently hides a
+// PERSISTENT failure — which is exactly why humidity looked frozen forever
+// once a cycle started. This tracks real failures instead of masking them.
+const unsigned long DHT_MIN_INTERVAL_MS = 2200UL; // respect the sensor's own refresh spec
+const int           DHT_FAIL_LIMIT      = 5;      // consecutive failures before flagging a real fault
+unsigned long lastDhtReadAttempt   = 0;
+int           dhtConsecutiveFails  = 0;
+bool          dhtFaulted           = false; // surfaced to dashboard/log instead of hidden
+unsigned long dhtFaultSinceMs      = 0;     // 0 = not currently faulted; else millis() when the fault began
+const unsigned long DHT_REINIT_AFTER_MS = 30000UL; // if stuck faulted this long, re-init the sensor instead of waiting for a power cycle
+
+// ── HEAP DIAGNOSTICS ──────────────────────────────────────────────────────────
+// The dashboard polls /data every second, forever. Building that response with
+// Arduino String concatenation (the old approach) allocates and frees dozens
+// of small heap blocks per request — over hours that fragments the heap badly,
+// and once an allocation somewhere fails, previously-fine subsystems (DHT
+// reads included) can start failing permanently with no obvious cause. This
+// logs free heap periodically so a slow fragmentation leak is visible before
+// it becomes a hard failure.
+unsigned long lastHeapLog = 0;
+const unsigned long HEAP_LOG_INTERVAL_MS = 30000UL;
 
 // ── DUAL-CORE AI SHARED STATE ────────────────────────────────────────────────
 volatile int   shared_ldr         = 0;
 volatile float shared_humidity    = 0.0;
 volatile float predicted_minutes  = 0.0;
 volatile bool  ai_needs_to_run    = false;
+// Feature snapshot fed to the model — frozen atomically at the moment the AI
+// is triggered (same instant as capturedLdr below), instead of reading the
+// live, still-drifting shared_ldr/shared_humidity from inside the async Core 0
+// task. Two features that are each frozen at slightly different times can
+// look like "the same input" cycle after cycle even when the room genuinely
+// changed — this guarantees both features come from one consistent instant.
+volatile int   ai_feature_ldr       = 0;
+volatile float ai_feature_humidity  = 0.0;
 volatile bool  ai_finished        = false;
 TaskHandle_t   AI_Task;
 
@@ -69,6 +121,7 @@ SystemState currentState = STANDBY;
 
 // ── SENSOR GLOBALS ────────────────────────────────────────────────────────────
 float currentThermal = 0.0f;
+float ambientTemp    = 25.0f;  // DHT22 ambient air temp — sane default until first valid read
 bool  radarMotion    = false;
 bool  doorOpen        = false;
 bool  systemIsSafe    = false;
@@ -364,6 +417,11 @@ table.htbl{width:100%;border-collapse:collapse;font-size:11px}
     <div class="hb"><div class="hf" id="hf"></div></div>
     <span class="sv" id="hv">--%</span>
   </div>
+  <div class="scard" id="acrd">
+    <span class="slbl">Ambient</span>
+    <div class="tb"><div class="tf" id="af" style="background:linear-gradient(to top,var(--b),var(--b))"></div><div class="tline" style="display:none"></div></div>
+    <span class="sv" id="av">--&#176;C</span>
+  </div>
 </div>
 
 <section class="aic" id="aic">
@@ -408,7 +466,7 @@ table.htbl{width:100%;border-collapse:collapse;font-size:11px}
   </table>
 </section>
 
-<div class="stats" id="stats"><span>CYCLES <b id="stCycles">--</b></span><span>CLIENTS <b id="stClients">--</b></span><span>UP <b id="stUptime">--</b></span></div>
+<div class="stats" id="stats"><span>CYCLES <b id="stCycles">--</b></span><span>CLIENTS <b id="stClients">--</b></span><span>UP <b id="stUptime">--</b></span><span>HEAP <b id="stHeap">--</b></span></div>
 <div class="ft" id="ft">--</div>
 </div>
 
@@ -554,12 +612,19 @@ function render(d){
   $('rcrd').className   = 'scard' + (mot ? ' al' : '');
   $('rv').textContent   = d.radar || '--';
 
-  // THERMAL (alert threshold fixed at 34.0C, matches isRoomSafe)
+  // THERMAL — ambient-relative occupancy check (fixes false positives in a hot room)
   var tmp = parseFloat(d.thermal);
-  var hot = !isNaN(tmp) && tmp > 34.0;
+  var ambient = parseFloat(d.ambientTemp);
+  var delta = parseFloat(d.thermalDelta);
+  var deltaThresh = (typeof d.thermalDeltaThreshold === 'number') ? d.thermalDeltaThreshold : 3.5;
+  var hot = !isNaN(delta) && delta > deltaThresh;
   $('tcrd').className = 'scard' + (hot ? ' al' : '');
   $('tv').innerHTML   = isNaN(tmp) ? '--&#176;C' : tmp.toFixed(1) + '&#176;C';
   $('tf').style.height = isNaN(tmp) ? '0%' : clamp((tmp-18)/(40-18)*100, 0, 100) + '%';
+
+  // AMBIENT (DHT22 room air temperature — the new thermal baseline)
+  $('av').innerHTML = isNaN(ambient) ? '--&#176;C' : ambient.toFixed(1) + '&#176;C';
+  $('af').style.height = isNaN(ambient) ? '0%' : clamp((ambient-18)/(40-18)*100, 0, 100) + '%';
 
   // DOOR
   var op = (d.door === 'OPEN');
@@ -571,7 +636,9 @@ function render(d){
   // HUMIDITY (informational — feeds the AI advisor)
   var hum = parseFloat(d.humidity);
   var humOk = !isNaN(hum);
-  $('hv').textContent = humOk ? hum.toFixed(1) + '%' : '--%';
+  var dhtFault = d.dhtFault === true;
+  $('hcrd').className = 'scard' + (dhtFault ? ' al' : '');
+  $('hv').textContent = dhtFault ? 'STALE' : (humOk ? hum.toFixed(1) + '%' : '--%');
   $('hf').style.height = (humOk ? clamp(hum,0,100) : 0) + '%';
 
   // AI DOSE ADVISOR + BULB HEALTH
@@ -653,6 +720,7 @@ function render(d){
   if(typeof d.cycleCount === 'number') $('stCycles').textContent = d.cycleCount;
   if(typeof d.clients === 'number')    $('stClients').textContent = d.clients;
   if(typeof d.uptimeSec === 'number')  $('stUptime').textContent = fmtUptime(d.uptimeSec);
+  if(typeof d.freeHeap === 'number')   $('stHeap').textContent = Math.round(d.freeHeap / 1024) + 'KB';
   $('ft').textContent = 'Updated ' + new Date().toLocaleTimeString();
 }
 
@@ -700,7 +768,7 @@ void runAILogic(void * parameter) {
     if (ai_needs_to_run) {
       Serial.println("[CORE 0] Triggered. Running TinyML regression inference...");
 
-      float features[2] = { (float)shared_ldr, shared_humidity };
+      float features[2] = { (float)ai_feature_ldr, ai_feature_humidity };
       signal_t features_signal;
       numpy::signal_from_buffer(features, EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE, &features_signal);
 
@@ -711,7 +779,15 @@ void runAILogic(void * parameter) {
       ai_needs_to_run    = false;
       ai_finished        = true;
 
-      Serial.print("[CORE 0] Inference complete. Predicted dose: ");
+      // Print the actual feature vector, not just the output — if LDR/humidity
+      // are barely changing cycle to cycle, the prediction won't either, and
+      // this line is how you confirm whether that's a sensor problem or the
+      // model genuinely seeing the same room conditions.
+      Serial.print("[CORE 0] Inference complete. Features: LDR=");
+      Serial.print(ai_feature_ldr);
+      Serial.print(" Humidity=");
+      Serial.print(ai_feature_humidity);
+      Serial.print(" -> Predicted dose: ");
       Serial.print(predicted_minutes);
       Serial.println(" min.");
     }
@@ -733,16 +809,77 @@ void readSensors() {
   for (int i = 0; i < 64; i++) if (pixels[i] > maxT) maxT = pixels[i];
   currentThermal = maxT;
 
-  shared_ldr = analogRead(LDR_PIN);
+  // Your LDR wiring reads HIGH when it's dark and LOW when it's bright — the
+  // opposite of what the AI model was trained on (high=bright, low=dark) and
+  // the opposite of what the bulb-health threshold expects. Invert once here
+  // so every downstream consumer (dashboard, AI features, LDR_FAULT_THRESHOLD
+  // check) sees high=bright, low=dark, without having to know about the
+  // physical wiring quirk.
+  int rawLdr = analogRead(LDR_PIN);
+  shared_ldr = LDR_ADC_MAX - rawLdr;
 
-  float h = dht.readHumidity();
-  if (!isnan(h)) shared_humidity = h;   // DHT22 reads intermittently fail; keep last good value
+  // DHT22: read on its OWN cadence (>=2.2s), decoupled from the 300ms loop
+  // that everything else uses. Reading it faster than its spec is what made
+  // it look "frozen" — the library either hands back a cached value or NaN,
+  // and the previous code just silently kept the last good value forever on
+  // NaN with no visibility into whether it was actually still working.
+  unsigned long nowDht = millis();
+  if (nowDht - lastDhtReadAttempt >= DHT_MIN_INTERVAL_MS) {
+    lastDhtReadAttempt = nowDht;
+
+    float h = dht.readHumidity();
+    float t = dht.readTemperature();
+    bool hOk = !isnan(h);
+    bool tOk = !isnan(t);
+
+    if (hOk) shared_humidity = h;
+    if (tOk) ambientTemp     = t;
+
+    if (hOk || tOk) {
+      dhtConsecutiveFails = 0;
+      dhtFaulted          = false;
+      dhtFaultSinceMs     = 0;
+    } else {
+      dhtConsecutiveFails++;
+      if (dhtConsecutiveFails >= DHT_FAIL_LIMIT && !dhtFaulted) {
+        dhtFaulted      = true;
+        dhtFaultSinceMs = nowDht;
+        Serial.println("[WARNING] DHT22: 5+ consecutive failed reads. Likely EMI from the "
+                        "relay/UV-C ballast coupling into the single-wire line, or a wiring/"
+                        "pull-up issue. Humidity and ambient temp are now STALE, not live.");
+      }
+    }
+
+    // Self-heal: DHT bit-bang libraries can wedge internally after enough
+    // failed reads — a known ESP32 quirk, often triggered or worsened by
+    // WiFi's interrupt bursts stealing the microsecond-precise timing DHT
+    // reads need. If it's been stuck faulted this long, re-run begin() to
+    // reset the library's internal state instead of needing a physical
+    // power cycle to recover.
+    if (dhtFaulted && dhtFaultSinceMs != 0 && (nowDht - dhtFaultSinceMs >= DHT_REINIT_AFTER_MS)) {
+      Serial.println("[RECOVERY] DHT22 stuck faulted 30s+ -> re-initializing sensor object.");
+      dht.begin();
+      dhtFaultSinceMs = nowDht; // if this attempt doesn't clear it, we'll retry again in another 30s
+    }
+  }
 }
 
 bool isRoomSafe() {
-  if (doorOpen)               return false;
-  if (radarMotion)            return false;
-  if (currentThermal > 34.0f) return false;
+  if (doorOpen)    return false;
+  if (radarMotion) return false;
+
+  // Ambient-relative thermal check: judge occupancy by how far the hottest
+  // AMG8833 pixel rises ABOVE the current DHT22 room-air reading, instead of
+  // a fixed absolute cutoff. This is what fixes false positives in a room
+  // that's simply warm/hot — a person's skin-surface reading still sits
+  // meaningfully above ambient even when ambient itself is high.
+  float delta = currentThermal - ambientTemp;
+  if (delta > THERMAL_DELTA_THRESHOLD) return false;
+
+  // Independent absolute safety ceiling (overheat/fire backstop), regardless
+  // of ambient — this is NOT the occupancy check, just a hard cap.
+  if (currentThermal > THERMAL_ABS_CEILING) return false;
+
   return true;
 }
 
@@ -750,9 +887,18 @@ bool isRoomSafe() {
 // order as isRoomSafe() above, so every log entry can say exactly why a
 // cycle failed instead of just "unsafe".
 String unsafeSensorReason() {
-  if (doorOpen)               return "door sensor (door opened)";
-  if (radarMotion)            return "radar sensor (motion detected)";
-  if (currentThermal > 34.0f) return "thermal sensor (room " + String(currentThermal, 1) + "C > 34.0C)";
+  if (doorOpen)    return "door sensor (door opened)";
+  if (radarMotion) return "radar sensor (motion detected)";
+
+  float delta = currentThermal - ambientTemp;
+  if (delta > THERMAL_DELTA_THRESHOLD) {
+    return "thermal sensor (" + String(delta, 1) + "C above ambient " + String(ambientTemp, 1) +
+           "C, limit " + String(THERMAL_DELTA_THRESHOLD, 1) + "C)";
+  }
+  if (currentThermal > THERMAL_ABS_CEILING) {
+    return "thermal sensor (" + String(currentThermal, 1) + "C exceeds absolute ceiling " +
+           String(THERMAL_ABS_CEILING, 1) + "C)";
+  }
   return "unknown sensor";
 }
 
@@ -902,13 +1048,22 @@ void runStateMachine() {
           // Lamp has had AI_TRIGGER_DELAY_MS to reach full brightness — the
           // LDR reading now actually reflects the bulb, not a cold read.
           aiTriggered     = true;
-          capturedLdr      = shared_ldr;   // freeze the bulb-health reading for the gate below
+          capturedLdr      = shared_ldr;        // freeze the bulb-health reading for the gate below
+          ai_feature_ldr      = capturedLdr;       // same frozen instant, fed to the AI
+          ai_feature_humidity = shared_humidity;   // frozen alongside it — not read separately later by Core 0
           ai_needs_to_run  = true;
           warmupTimeLeft   = 0;
           Serial.print("[WARMUP] Lamp warmed up (");
           Serial.print(elapsed);
           Serial.print("ms) -> AI dose advisor triggered. LDR=");
-          Serial.println(capturedLdr);
+          Serial.print(capturedLdr);
+          Serial.print(" Humidity=");
+          Serial.println(ai_feature_humidity);
+          if (dhtFaulted) {
+            Serial.println("[WARNING] DHT22 is currently flagged FAULTED — the humidity feature "
+                            "above is a stale cached value, not a live reading. Predictions will "
+                            "look repetitive until this clears.");
+          }
           break;   // give Core 0 a tick to pick up the inference request
         }
 
@@ -1010,46 +1165,43 @@ void handleData() {
   server.sendHeader("Cache-Control", "no-store");
   server.sendHeader("Connection", "close");
 
-  String json = "{";
-  json += "\"thermal\":"        + String(currentThermal, 1)                             + ",";
-  json += "\"radar\":\""        + String(radarMotion ? "MOTION" : "CLEAR")               + "\",";
-  json += "\"door\":\""         + String(doorOpen    ? "OPEN"   : "CLOSED")              + "\",";
-  json += "\"humidity\":"       + String(shared_humidity, 1)                             + ",";
-  json += "\"ldr\":"            + String(shared_ldr)                                     + ",";
-  json += "\"ldrThreshold\":"   + String(LDR_FAULT_THRESHOLD)                            + ",";
-  json += "\"aiReady\":"        + String(ai_finished ? "true" : "false")                 + ",";
-  json += "\"predictedMinutes\":" + String(predicted_minutes, 1)                          + ",";
-  json += "\"isSafe\":"         + String(systemIsSafe ? "true" : "false")                + ",";
-  json += "\"uvcActive\":"      + String(currentState == UVC_ACTIVE ? "true" : "false")  + ",";
-  json += "\"state\":\""        + stateLabel()                                            + "\",";
-  json += "\"breachReason\":\"" + lastBreachReason                                        + "\",";
-  json += "\"hardwareFault\":"  + String(unsafeIsHardwareFault ? "true" : "false")        + ",";
-  json += "\"log\":\""          + logMessage                                              + "\",";
-  json += "\"timer\":"          + String(countdownLeft)                                   + ",";
-  json += "\"total\":"          + String(calculatedUvcDurationMs)                         + ",";
-  json += "\"scanTimer\":"      + String(scanTimeLeft)                                    + ",";
-  json += "\"scanTotal\":"      + String(SCAN_DURATION_MS)                                + ",";
-  json += "\"warmupTimer\":"    + String(warmupTimeLeft)                                  + ",";
-  json += "\"warmupTotal\":"    + String(AI_TRIGGER_DELAY_MS)                             + ",";
-  json += "\"autoStartIn\":"    + String(autoStartInMs)                                   + ",";
-  json += "\"autoStartTotal\":" + String(AUTO_START_DELAY_MS)                             + ",";
-  json += "\"cycleCount\":"     + String(totalCyclesRun)                                  + ",";
-  json += "\"clients\":"        + String(WiFi.softAPgetStationNum())                      + ",";
-  json += "\"uptimeSec\":"      + String(millis() / 1000)                                 + ",";
+  // Built with a fixed buffer + snprintf instead of Arduino String
+  // concatenation. This handler runs on EVERY dashboard poll (once a second,
+  // forever) — the old String-based version allocated and freed dozens of
+  // small heap blocks per request, which fragments the heap over hours of
+  // continuous operation. That's the most likely reason the whole system
+  // (DHT22 included) can degrade or lock up permanently after "some cycles"
+  // rather than recovering. `static` keeps this off the stack.
+  static char json[2600];
+  int len = 0;
 
-  json += "\"history\": [";
-  for (int i = logCount - 1; i >= 0; i--) {
-    json += "{";
-    json += "\"status\":\""   + cycleLogs[i].status                          + "\",";
-    json += "\"duration\":\"" + String(cycleLogs[i].durationMins, 1)         + "\",";
-    json += "\"time\":\""     + cycleLogs[i].timestamp                       + "\",";
-    json += "\"date\":\""     + cycleLogs[i].dateStamp                       + "\",";
-    json += "\"reason\":\""   + cycleLogs[i].reason                          + "\"";
-    json += "}";
-    if (i > 0) json += ",";
+  len += snprintf(json + len, sizeof(json) - len,
+    "{\"thermal\":%.1f,\"ambientTemp\":%.1f,\"thermalDelta\":%.1f,\"thermalDeltaThreshold\":%.1f,"
+    "\"radar\":\"%s\",\"door\":\"%s\",\"humidity\":%.1f,\"dhtFault\":%s,\"dhtFailCount\":%d,"
+    "\"ldr\":%d,\"ldrThreshold\":%d,\"aiReady\":%s,\"predictedMinutes\":%.1f,"
+    "\"isSafe\":%s,\"uvcActive\":%s,\"state\":\"%s\",\"breachReason\":\"%s\",\"hardwareFault\":%s,"
+    "\"log\":\"%s\",\"timer\":%lu,\"total\":%lu,\"scanTimer\":%lu,\"scanTotal\":%lu,"
+    "\"warmupTimer\":%lu,\"warmupTotal\":%lu,\"autoStartIn\":%lu,\"autoStartTotal\":%lu,"
+    "\"cycleCount\":%lu,\"clients\":%d,\"uptimeSec\":%lu,\"freeHeap\":%u,",
+    currentThermal, ambientTemp, currentThermal - ambientTemp, THERMAL_DELTA_THRESHOLD,
+    radarMotion ? "MOTION" : "CLEAR", doorOpen ? "OPEN" : "CLOSED", shared_humidity,
+    dhtFaulted ? "true" : "false", dhtConsecutiveFails,
+    shared_ldr, LDR_FAULT_THRESHOLD, ai_finished ? "true" : "false", predicted_minutes,
+    systemIsSafe ? "true" : "false", (currentState == UVC_ACTIVE) ? "true" : "false",
+    stateLabel().c_str(), lastBreachReason.c_str(), unsafeIsHardwareFault ? "true" : "false",
+    logMessage.c_str(), countdownLeft, calculatedUvcDurationMs, scanTimeLeft, SCAN_DURATION_MS,
+    warmupTimeLeft, AI_TRIGGER_DELAY_MS, autoStartInMs, AUTO_START_DELAY_MS,
+    totalCyclesRun, WiFi.softAPgetStationNum(), (unsigned long)(millis() / 1000),
+    (unsigned int)ESP.getFreeHeap());
+
+  len += snprintf(json + len, sizeof(json) - len, "\"history\": [");
+  for (int i = logCount - 1; i >= 0 && len < (int)sizeof(json) - 200; i--) {
+    len += snprintf(json + len, sizeof(json) - len,
+      "{\"status\":\"%s\",\"duration\":\"%.1f\",\"time\":\"%s\",\"date\":\"%s\",\"reason\":\"%s\"}%s",
+      cycleLogs[i].status.c_str(), cycleLogs[i].durationMins, cycleLogs[i].timestamp.c_str(),
+      cycleLogs[i].dateStamp.c_str(), cycleLogs[i].reason.c_str(), (i > 0) ? "," : "");
   }
-  json += "]";
-  json += "}";
+  len += snprintf(json + len, sizeof(json) - len, "]}");
 
   server.send(200, "application/json", json);
 }
@@ -1118,7 +1270,7 @@ void setup() {
   Serial.println("[OK] AMG8833 thermal camera ready.");
 
   dht.begin();
-  Serial.println("[OK] DHT22 humidity sensor ready.");
+  Serial.println("[OK] DHT22 humidity + ambient temperature sensor ready.");
 
   xTaskCreatePinnedToCore(runAILogic, "AI_Task", 10000, NULL, 1, &AI_Task, 0);
   Serial.println("[OK] AI advisor task spawned on Core 0.");
@@ -1151,6 +1303,14 @@ void loop() {
   }
 
   runStateMachine();
+
+  if (now - lastHeapLog >= HEAP_LOG_INTERVAL_MS) {
+    lastHeapLog = now;
+    Serial.print("[HEAP] Free: ");
+    Serial.print(ESP.getFreeHeap());
+    Serial.println(" bytes. A steady downward trend over hours points to heap "
+                    "fragmentation as the cause of any long-run lockups.");
+  }
 
   server.handleClient();   // network again — catches anything queued during the sensor read
 }
