@@ -1,0 +1,23 @@
+# Arduino / build output
+build/
+*.elf
+*.bin
+*.map
+*.hex
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+# Webots
+simulation/**/*.wbproj
+simulation/**/.*.wbproj
+simulation/**/libraries/
+
+# Local secrets or scratch
+firmware/*/secrets.h
+*.env
+scratch/
