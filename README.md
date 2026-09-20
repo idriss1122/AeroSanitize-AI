@@ -9,7 +9,7 @@ A ceiling-mounted UV-C controller that will not switch the lamp on until three i
 
 ![Aero-Sanitize AI banner](docs/images/banner.png)
 
-![Demo: someone walks in mid-cycle and the lamp cuts out](docs/images/demo.gif)
+
 
 *Above: a person enters during a cycle. The lamp relay drops and the dashboard flips to "Cycle interrupted".*
 
@@ -164,7 +164,8 @@ Two things that cost us time and are worth knowing before you wire anything:
 
 The relay in our demo switches a 220 V **blue LED bulb**, not a germicidal tube. Everything about the control logic is identical, and nobody gets burned if a demo goes wrong. See the safety notice at the bottom before you put a real UV-C source anywhere near this.
 
-![Assembled prototype](docs/images/hardware-overview.jpg)
+![Assembled prototype on the inside](docs/images/hardware-overview-inside.jpg)
+![Assembled prototype on the outside](docs/images/hardware-overview-outside.jpg)
 
 ![Wiring diagram](docs/images/wiring-diagram.png)
 
@@ -178,7 +179,6 @@ The CDM324 produces a microvolt-scale signal that has to be built up before a mi
 
 The potentiometer is the sensitivity control, so expect to tune it once per installation.
 
-![Radar conditioning circuit](docs/images/radar-signal-chain.jpg)
 
 ## Getting started
 
@@ -215,7 +215,6 @@ You should see something like this:
 [READY] STANDBY. Auto-arms after 10s of a clear room.
 ```
 
-![Serial monitor on boot](docs/images/serial-monitor.png)
 
 If the AMG8833 isn't found, the unit halts on purpose. It won't run a cycle without its thermal guard.
 
@@ -243,7 +242,6 @@ Encrypted ESP-NOW can't be broadcast, so the two boards have to know each other'
 
 One thing to watch: the main unit inverts its own LDR reading (`4095 - raw`) because our divider reads high in the dark. The remote sends the raw value unless you set `LDR_INVERT` to 1 in its sketch. Set it so that higher means brighter on both.
 
-![Remote room unit](docs/images/remote-unit.jpg)
 
 ## Configuration
 
@@ -289,12 +287,6 @@ Each cycle ends up as one of three statuses:
 Every entry stores the RTC time, the predicted minutes, and a reason string that names the sensor that tripped, for example *"During active cycle: radar sensor (motion detected)"*.
 
 Storage is in the `aerolog` NVS namespace. A record is 49 bytes (timestamp, dose, status code, 40-byte reason), a slot costs about 96 bytes on flash after NVS overhead, so 100 entries is under 10 KB. The busy-hours counters are one 96-byte blob, flushed every 15 minutes and only when something changed, which means a sudden power loss can cost up to 15 minutes of the newest occupancy data.
-
-## Simulation
-
-Before building anything physical we made a digital twin: a 3D hospital room in Webots R2023b with a Python controller. It was used to check radar and thermal tracking and the emergency shutoff against pedestrians walking through the room. Files are in [simulation/](simulation/).
-
-![Webots simulation](docs/images/webots-simulation.png)
 
 ## The model
 
@@ -344,14 +336,6 @@ This device switches mains voltage and is meant to control a source that can ser
 - Use a visible-light bulb for development and demos.
 - UV-C damages skin and eyes. Don't point a real germicidal lamp at anything you wouldn't want sterilized, and never test the interlock by putting yourself in the room.
 - Nothing here has been validated for clinical use.
-
-## Team
-
-<!-- TODO: names and roles -->
-- [Name], [role]
-- [Name], [role]
-
-Built for [Hackathon name], 2026.
 
 ## License
 

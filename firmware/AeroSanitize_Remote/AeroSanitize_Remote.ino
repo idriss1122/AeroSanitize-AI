@@ -32,7 +32,7 @@
 // ── CONFIG ────────────────────────────────────────────────────────────────
 #define ROOM_NAME        "Room 2"   // shown on the hub's Fleet Status card (15 chars max)
 #define ESPNOW_CHANNEL   6          // MUST match AeroSanitize_Main.ino
-#define LDR_PIN          34         // ADC1 pin. On an ESP32-S3 use GPIO 1-10
+#define LDR_PIN          4         // ADC1 pin. On an ESP32-S3 use GPIO 1-10
 #define SEND_INTERVAL_MS 2000UL     // how often to send a reading
 #define LDR_INVERT       0          // 1 = send (4095 - raw) so higher = brighter, like the hub's own LDR
 

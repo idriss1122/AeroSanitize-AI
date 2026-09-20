@@ -55,6 +55,4 @@ The two reed switches are wired in series into the single door input, so opening
 
 **Mains.** The relay contacts carry 220 V. Enclose them, keep them apart from the low-voltage side, and have someone qualified check the wiring. Use the LED bulb until you have a proper reason to use anything else.
 
-## Photos
 
-Add wiring diagrams and build photos to `docs/images/` and reference them from the main README.
